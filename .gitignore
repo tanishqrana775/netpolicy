@@ -1,5 +1,55 @@
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
-.env
+*.py[cod]
+*$py.class
+
+# Environments
 .venv/
+venv/
+ENV/
+env/
+
+# Packaging / Distribution
+dist/
+build/
+*.egg-info/
+
+# Netpolicy audit data and reports
 reports/
+*.jsonl
+
+# Testing & Quality
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editor & OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Custom Virtual Environments
+.linux-venv/
+
+# Local Audit Outputs & Demos
+demo-output/
+my_wifi.json
+my_hotspot.json
+*.json
+
+# Generated Documents (Optional, to keep repo clean of binaries)
+*.docx
+*.pdf
+
+# Testing & Cyber-Range Lab (Keep local only)
+lab/
+scripts/demo.sh
+tests/
+
+# Generated Documents
+*.docx
+*.pdf
