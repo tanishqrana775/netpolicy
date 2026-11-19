@@ -1,6 +1,7 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
+*.pyc
 *$py.class
 
 # Environments
@@ -15,8 +16,16 @@ build/
 *.egg-info/
 
 # Netpolicy audit data and reports
-reports/
+reports/*.jsonl
+reports/*.json
+reports/*.pcap
+reports/*.pcapng
+reports/*.md
 *.jsonl
+*.pcap
+*.pcapng
+scratch/
+scratch
 
 # Testing & Quality
 .pytest_cache/
@@ -48,8 +57,3 @@ my_hotspot.json
 # Testing & Cyber-Range Lab (Keep local only)
 lab/
 scripts/demo.sh
-tests/
-
-# Generated Documents
-*.docx
-*.pdf

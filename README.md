@@ -57,6 +57,53 @@ sudo bash scripts/demo.sh
 
 ---
 
+## Interactive Guided Wizard
+
+Simply run `netpolicy` with no arguments in an interactive terminal to launch the guided wizard:
+
+```text
+ ── netpolicy wizard | What would you like to do?  (Step 1 of 4) ──
+
+What would you like to do?
+  1 Full network policy audit (ports, DNS, and HTTP canary checks)
+  2 Check specific outbound ports (e.g. mail, SSH, web)
+  3 Test DNS integrity (hijacking, NXDOMAIN poisoning, DoH cross-check)
+  4 Test HTTP content integrity (proxy injection, header rewriting)
+  5 Compare two past audit runs (baseline vs. current)
+  6 Reclassify saved raw observations against updated rules
+  7 Explore or reset the Linux network namespace lab
+  8 Explain all commands and concepts
+  Navigation: quit, ?help
+```
+
+The wizard guides you through:
+1. **Target and Port Specification**: Choose from common service presets or supply custom ports with strict RFC validation.
+2. **Safety Authorization**: Verifies explicit testing consent and displays the exact CLI command before running.
+3. **In-Process Audit Execution**: Runs active network probes while optionally capturing Wireshark PCAPs.
+4. **Actionable Recommendations & Next Steps**: Suggests drill-downs, re-runs, and exports a 12-section **Academic Markdown Lab Report** (`reports/lab-report-<run_id>.md`).
+
+### Advanced Wizard Options
+```bash
+# Explicit wizard invocation
+netpolicy wizard
+
+# Export the underlying finite-state machine diagram (Mermaid or Graphviz DOT)
+netpolicy wizard --graph mermaid
+netpolicy wizard --graph dot
+
+# Record an interactive session transcript for reproducible lab grading
+netpolicy wizard --transcript reports/my-session.json
+
+# Replay a previously recorded session non-interactively
+netpolicy wizard --replay reports/my-session.json
+
+# Escape hatches: disable wizard to print standard CLI help
+netpolicy --no-wizard
+export NETPOLICY_NO_WIZARD=1
+```
+
+---
+
 ## Installation
 
 ### Prerequisites
@@ -97,6 +144,15 @@ source .venv/bin/activate       # On Windows: .venv\Scripts\Activate.ps1
 pip install --upgrade pip
 pip install -e ".[dev]"
 ```
+
+### Windows: Global Command (Optional Final Step)
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
+```
+Close and reopen the terminal, then run `netpolicy --version`.
+To remove the command, run `powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -Uninstall`.
+If the repo folder is moved, recreate the venv and re-run the script.
+Note that raw-packet mode and the lab need Linux (WSL).
 
 ### Root Privileges & Probe Modes
 - **Root Mode (`--mode raw`)**: Crafts raw TCP SYN packets with randomized sequence numbers and custom source ports, capturing both TCP SYN-ACK/RST responses and in-path ICMP unreachable packets.

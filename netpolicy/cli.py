@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
+import sys
 import threading
 import time
 from enum import Enum
@@ -59,11 +61,19 @@ from netpolicy.report.jsonout import (
 from netpolicy.report.markdown import generate_markdown_report
 from netpolicy.report.terminal import render_terminal_report
 from netpolicy.store.raw import RawObservationStore, chown_to_sudo_user, read_run
+from netpolicy.ui import (
+    get_ui_console,
+    maybe_launch_wsl,
+    print_welcome,
+    set_global_no_banner,
+    should_show_banner,
+    ui_session,
+)
 
 app = typer.Typer(
     name="netpolicy",
     help="CLI network policy auditor to detect silent blocking, interception, and tampering.",
-    no_args_is_help=True,
+    no_args_is_help=False,
     add_completion=False,
 )
 
@@ -84,8 +94,9 @@ def version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-@app.callback()
+@app.callback(invoke_without_command=True)
 def main(
+    ctx: typer.Context,
     version: bool | None = typer.Option(
         None,
         "--version",
@@ -93,9 +104,64 @@ def main(
         is_eager=True,
         help="Show netpolicy version and exit.",
     ),
+    no_banner: bool = typer.Option(
+        False,
+        "--no-banner",
+        help="Disable gradient welcome banner and compact headers.",
+    ),
+    no_wizard: bool = typer.Option(
+        False,
+        "--no-wizard",
+        help="Disable interactive wizard and print standard help.",
+    ),
 ) -> None:
     """Audit network policies, egress filtering, and traffic interception."""
-    # Callback handles eager flags like --version
+    if no_banner:
+        set_global_no_banner(True)
+
+    if ctx.invoked_subcommand is None:
+        ui_console = get_ui_console()
+        is_interactive = sys.stdin.isatty() and sys.stderr.isatty()
+        is_handoff = os.environ.get("NETPOLICY_HANDOFF") == "1"
+        banner_allowed = (
+            should_show_banner(no_banner_flag=no_banner, stream=ui_console.file) and not is_handoff
+        )
+
+        # 1. If session is interactive and animation is not suppressed, call print_welcome()
+        if is_interactive and banner_allowed:
+            print_welcome(ui_console)
+
+        # 2. If session is interactive and banner flags not set and NETPOLICY_NO_WSL_PROMPT not set:
+        no_wsl_prompt = os.environ.get("NETPOLICY_NO_WSL_PROMPT")
+        skip_wsl = is_handoff or (
+            no_wsl_prompt is not None
+            and no_wsl_prompt != ""
+            and no_wsl_prompt.lower() not in ("0", "false", "no")
+        )
+
+        if is_interactive and not skip_wsl and not no_banner:
+            wsl_code = maybe_launch_wsl(ui_console)
+            if wsl_code is not None:
+                raise typer.Exit(code=wsl_code)
+
+        # 3. If session is interactive and wizard is not suppressed, launch the guided wizard
+        env_no_wizard = os.environ.get("NETPOLICY_NO_WIZARD", "")
+        wizard_suppressed = no_wizard or (
+            env_no_wizard is not None
+            and env_no_wizard != ""
+            and env_no_wizard.lower() not in ("0", "false", "no")
+        )
+
+        if is_interactive and not wizard_suppressed:
+            from netpolicy.wizard.ui import run_wizard
+
+            code, _ = run_wizard()
+            raise typer.Exit(code=code)
+
+        # 4. Otherwise print standard Typer help exactly as "netpolicy --help" renders it
+        console = Console()
+        console.print(ctx.get_help())
+        raise typer.Exit(code=0)
 
 
 def _render_config_table(
@@ -494,6 +560,7 @@ def handle_report_completion(
         section=section,
         show_progress=not cfg.general.quiet,
         quiet=cfg.general.quiet,
+        verbose=cfg.general.verbose,
         no_color=cfg.general.no_color,
     )
     raise typer.Exit(code=exit_code)
@@ -588,6 +655,9 @@ def audit(
     ),
     demo: bool = typer.Option(False, "--demo", help="Run with mock data."),
     config: Path | None = typer.Option(None, "--config", "-c", help="Path to YAML config."),
+    no_banner: bool = typer.Option(
+        False, "--no-banner", help="Disable gradient header and footer."
+    ),
 ) -> None:
     """Execute full network audit (ports + DNS + HTTP)."""
     cfg, active_ports, console = _prepare_config(
@@ -608,117 +678,125 @@ def audit(
         config=config,
         require_target=True,
     )
-    if control_port is not None:
-        cfg.ports.control_port = control_port
-
-    if demo:
-        report = build_demo_report()
-        report.metadata.mode = cfg.ports.mode
-        report.metadata.runs_per_check = cfg.ports.runs
-        report.metadata.include_identifiers = cfg.general.include_identifiers
-        if cfg.general.target:
-            report.metadata.target = cfg.general.target
-        handle_report_completion(report, cfg, "audit", console)
-
-    if not cfg.general.quiet and not cfg.general.json_output:
-        _render_config_table("audit", cfg, active_ports, console)
-
-    target_host = cfg.general.target or ""
-    control_target = Target(
-        host=target_host,
-        port=cfg.ports.control_port,
-        service="Control",
-        expect_open=True,
-    )
-    ctx = Context(
+    with ui_session(
+        command="audit",
+        target=cfg.general.target,
         mode=cfg.ports.mode,
-        timeout=cfg.ports.timeout,
-        retries=cfg.ports.retries,
-        runs=cfg.ports.runs,
-        control_target=control_target,
-    )
+        json_flag=json_output,
+        quiet_flag=quiet,
+        no_banner=no_banner,
+    ):
+        if control_port is not None:
+            cfg.ports.control_port = control_port
 
-    probe_cls: type[Probe] = TcpSynProbe if ctx.mode == "raw" else TcpConnectProbe
+        if demo:
+            report = build_demo_report()
+            report.metadata.mode = cfg.ports.mode
+            report.metadata.runs_per_check = cfg.ports.runs
+            report.metadata.include_identifiers = cfg.general.include_identifiers
+            if cfg.general.target:
+                report.metadata.target = cfg.general.target
+            handle_report_completion(report, cfg, "audit", console)
 
-    try:
-        ports_probe = probe_cls()
-        control_probe = probe_cls()
-    except PermissionError as exc:
-        console.print(f"[bold red]Permission Error:[/bold red] {exc}")
-        raise typer.Exit(code=2) from exc
+        if not cfg.general.quiet and not cfg.general.json_output:
+            _render_config_table("audit", cfg, active_ports, console)
 
-    # 1. Ports jobs
-    port_jobs: list[tuple[Probe, Target]] = []
-    for p in active_ports:
-        is_ctrl = p.port == cfg.ports.control_port
-        port_jobs.append(
+        target_host = cfg.general.target or ""
+        control_target = Target(
+            host=target_host,
+            port=cfg.ports.control_port,
+            service="Control",
+            expect_open=True,
+        )
+        ctx = Context(
+            mode=cfg.ports.mode,
+            timeout=cfg.ports.timeout,
+            retries=cfg.ports.retries,
+            runs=cfg.ports.runs,
+            control_target=control_target,
+        )
+
+        probe_cls: type[Probe] = TcpSynProbe if ctx.mode == "raw" else TcpConnectProbe
+
+        try:
+            ports_probe = probe_cls()
+            control_probe = probe_cls()
+        except PermissionError as exc:
+            console.print(f"[bold red]Permission Error:[/bold red] {exc}")
+            raise typer.Exit(code=2) from exc
+
+        # 1. Ports jobs
+        port_jobs: list[tuple[Probe, Target]] = []
+        for p in active_ports:
+            is_ctrl = p.port == cfg.ports.control_port
+            port_jobs.append(
+                (
+                    ports_probe,
+                    Target(
+                        host=target_host,
+                        port=p.port,
+                        service=p.service,
+                        expect_open=is_ctrl,
+                    ),
+                )
+            )
+
+        # 2. DNS jobs
+        dns_jobs: list[tuple[Probe, Target]] = [
             (
-                ports_probe,
+                BlackholeProbe(cfg.dns.blackhole_servers),
+                Target(host=target_host, port=53, service="DNS-Blackhole"),
+            ),
+            (
+                WhoamiProbe(cfg.dns.whoami_name, cfg.dns.whoami_resolver),
+                Target(host=target_host, port=53, service="DNS-Whoami"),
+            ),
+            (
+                NxdomainProbe(cfg.dns.nxdomain_count, cfg.dns.nxdomain_resolver),
+                Target(host=target_host, port=53, service="DNS-Nxdomain"),
+            ),
+            (
+                DohCrossCheckProbe(
+                    cfg.dns.doh_crosscheck_domains,
+                    cfg.dns.doh_crosscheck_resolver,
+                    cfg.dns.doh_crosscheck_url,
+                ),
+                Target(host=target_host, port=53, service="DNS-DoH"),
+            ),
+            (
+                SourceMismatchProbe(cfg.dns.source_mismatch_resolvers),
+                Target(host=target_host, port=53, service="DNS-SourceMismatch"),
+            ),
+        ]
+
+        # 3. HTTP jobs
+        http_probe = HttpCanaryProbe(
+            http_port=80,
+            https_port=443,
+            user_agent=cfg.http.user_agent,
+        )
+        http_jobs: list[tuple[Probe, Target]] = [
+            (
+                http_probe,
                 Target(
                     host=target_host,
-                    port=p.port,
-                    service=p.service,
-                    expect_open=is_ctrl,
+                    port=p,
+                    service="HTTP" if p == 80 else ("HTTPS" if p == 443 else f"HTTP-{p}"),
                 ),
             )
+            for p in cfg.http.ports
+        ]
+
+        all_jobs = port_jobs + dns_jobs + http_jobs
+
+        _execute_audit_flow(
+            command_name="audit",
+            jobs=all_jobs,
+            ctx=ctx,
+            cfg=cfg,
+            console=console,
+            control_probe=control_probe,
         )
-
-    # 2. DNS jobs
-    dns_jobs: list[tuple[Probe, Target]] = [
-        (
-            BlackholeProbe(cfg.dns.blackhole_servers),
-            Target(host=target_host, port=53, service="DNS-Blackhole"),
-        ),
-        (
-            WhoamiProbe(cfg.dns.whoami_name, cfg.dns.whoami_resolver),
-            Target(host=target_host, port=53, service="DNS-Whoami"),
-        ),
-        (
-            NxdomainProbe(cfg.dns.nxdomain_count, cfg.dns.nxdomain_resolver),
-            Target(host=target_host, port=53, service="DNS-Nxdomain"),
-        ),
-        (
-            DohCrossCheckProbe(
-                cfg.dns.doh_crosscheck_domains,
-                cfg.dns.doh_crosscheck_resolver,
-                cfg.dns.doh_crosscheck_url,
-            ),
-            Target(host=target_host, port=53, service="DNS-DoH"),
-        ),
-        (
-            SourceMismatchProbe(cfg.dns.source_mismatch_resolvers),
-            Target(host=target_host, port=53, service="DNS-SourceMismatch"),
-        ),
-    ]
-
-    # 3. HTTP jobs
-    http_probe = HttpCanaryProbe(
-        http_port=80,
-        https_port=443,
-        user_agent=cfg.http.user_agent,
-    )
-    http_jobs: list[tuple[Probe, Target]] = [
-        (
-            http_probe,
-            Target(
-                host=target_host,
-                port=p,
-                service="HTTP" if p == 80 else ("HTTPS" if p == 443 else f"HTTP-{p}"),
-            ),
-        )
-        for p in cfg.http.ports
-    ]
-
-    all_jobs = port_jobs + dns_jobs + http_jobs
-
-    _execute_audit_flow(
-        command_name="audit",
-        jobs=all_jobs,
-        ctx=ctx,
-        cfg=cfg,
-        console=console,
-        control_probe=control_probe,
-    )
 
 
 @app.command("ports")
@@ -748,6 +826,9 @@ def ports(
     ),
     demo: bool = typer.Option(False, "--demo", help="Run with mock data."),
     config: Path | None = typer.Option(None, "--config", "-c", help="Path to YAML config."),
+    no_banner: bool = typer.Option(
+        False, "--no-banner", help="Disable gradient header and footer."
+    ),
 ) -> None:
     """Audit outbound port reachability and firewall behavior."""
     cfg, active_ports, console = _prepare_config(
@@ -768,68 +849,76 @@ def ports(
         config=config,
         require_target=True,
     )
-    if control_port is not None:
-        cfg.ports.control_port = control_port
-
-    if demo:
-        report = build_demo_report()
-        report.metadata.mode = cfg.ports.mode
-        report.metadata.runs_per_check = cfg.ports.runs
-        report.metadata.include_identifiers = cfg.general.include_identifiers
-        if cfg.general.target:
-            report.metadata.target = cfg.general.target
-        handle_report_completion(report, cfg, "ports", console)
-
-    if not cfg.general.quiet and not cfg.general.json_output:
-        _render_config_table("ports", cfg, active_ports, console)
-
-    target_host = cfg.general.target or ""
-    control_target = Target(
-        host=target_host,
-        port=cfg.ports.control_port,
-        service="Control",
-        expect_open=True,
-    )
-    ctx = Context(
+    with ui_session(
+        command="ports",
+        target=cfg.general.target,
         mode=cfg.ports.mode,
-        timeout=cfg.ports.timeout,
-        retries=cfg.ports.retries,
-        runs=cfg.ports.runs,
-        control_target=control_target,
-    )
+        json_flag=json_output,
+        quiet_flag=quiet,
+        no_banner=no_banner,
+    ):
+        if control_port is not None:
+            cfg.ports.control_port = control_port
 
-    probe_cls: type[Probe] = TcpSynProbe if ctx.mode == "raw" else TcpConnectProbe
+        if demo:
+            report = build_demo_report()
+            report.metadata.mode = cfg.ports.mode
+            report.metadata.runs_per_check = cfg.ports.runs
+            report.metadata.include_identifiers = cfg.general.include_identifiers
+            if cfg.general.target:
+                report.metadata.target = cfg.general.target
+            handle_report_completion(report, cfg, "ports", console)
 
-    try:
-        probe_instance = probe_cls()
-        control_probe = probe_cls()
-    except PermissionError as exc:
-        console.print(f"[bold red]Permission Error:[/bold red] {exc}")
-        raise typer.Exit(code=2) from exc
+        if not cfg.general.quiet and not cfg.general.json_output:
+            _render_config_table("ports", cfg, active_ports, console)
 
-    jobs: list[tuple[Probe, Target]] = []
-    for p in active_ports:
-        is_ctrl = p.port == cfg.ports.control_port
-        jobs.append(
-            (
-                probe_instance,
-                Target(
-                    host=target_host,
-                    port=p.port,
-                    service=p.service,
-                    expect_open=is_ctrl,
-                ),
-            )
+        target_host = cfg.general.target or ""
+        control_target = Target(
+            host=target_host,
+            port=cfg.ports.control_port,
+            service="Control",
+            expect_open=True,
+        )
+        ctx = Context(
+            mode=cfg.ports.mode,
+            timeout=cfg.ports.timeout,
+            retries=cfg.ports.retries,
+            runs=cfg.ports.runs,
+            control_target=control_target,
         )
 
-    _execute_audit_flow(
-        command_name="ports",
-        jobs=jobs,
-        ctx=ctx,
-        cfg=cfg,
-        console=console,
-        control_probe=control_probe,
-    )
+        probe_cls: type[Probe] = TcpSynProbe if ctx.mode == "raw" else TcpConnectProbe
+
+        try:
+            probe_instance = probe_cls()
+            control_probe = probe_cls()
+        except PermissionError as exc:
+            console.print(f"[bold red]Permission Error:[/bold red] {exc}")
+            raise typer.Exit(code=2) from exc
+
+        jobs: list[tuple[Probe, Target]] = []
+        for p in active_ports:
+            is_ctrl = p.port == cfg.ports.control_port
+            jobs.append(
+                (
+                    probe_instance,
+                    Target(
+                        host=target_host,
+                        port=p.port,
+                        service=p.service,
+                        expect_open=is_ctrl,
+                    ),
+                )
+            )
+
+        _execute_audit_flow(
+            command_name="ports",
+            jobs=jobs,
+            ctx=ctx,
+            cfg=cfg,
+            console=console,
+            control_probe=control_probe,
+        )
 
 
 @app.command("dns")
@@ -854,6 +943,9 @@ def dns(
     ),
     demo: bool = typer.Option(False, "--demo", help="Run with mock data."),
     config: Path | None = typer.Option(None, "--config", "-c", help="Path to YAML config."),
+    no_banner: bool = typer.Option(
+        False, "--no-banner", help="Disable gradient header and footer."
+    ),
 ) -> None:
     """Audit DNS interception, redirection, and tampering."""
     cfg, active_ports, console = _prepare_config(
@@ -874,65 +966,73 @@ def dns(
         config=config,
         require_target=False,
     )
-    if demo:
-        report = build_demo_report()
-        report.metadata.mode = cfg.ports.mode
-        report.metadata.runs_per_check = cfg.ports.runs
-        report.metadata.include_identifiers = cfg.general.include_identifiers
-        if cfg.general.target:
-            report.metadata.target = cfg.general.target
-        handle_report_completion(report, cfg, "dns", console)
-
-    if not cfg.general.quiet and not cfg.general.json_output:
-        _render_config_table("dns", cfg, active_ports, console)
-
-    ctx = Context(
+    with ui_session(
+        command="dns",
+        target=cfg.general.target or "auto",
         mode=cfg.ports.mode,
-        timeout=cfg.dns.timeout,
-        retries=cfg.dns.retries,
-        runs=cfg.ports.runs,
-        control_target=Target(
-            host=cfg.general.control_target,
-            port=53,
-            service="Control-DNS",
-        ),
-    )
+        json_flag=json_output,
+        quiet_flag=quiet,
+        no_banner=no_banner,
+    ):
+        if demo:
+            report = build_demo_report()
+            report.metadata.mode = cfg.ports.mode
+            report.metadata.runs_per_check = cfg.ports.runs
+            report.metadata.include_identifiers = cfg.general.include_identifiers
+            if cfg.general.target:
+                report.metadata.target = cfg.general.target
+            handle_report_completion(report, cfg, "dns", console)
 
-    target_host = cfg.general.target or "auto"
-    jobs: list[tuple[Probe, Target]] = [
-        (
-            BlackholeProbe(cfg.dns.blackhole_servers),
-            Target(host=target_host, port=53, service="DNS-Blackhole"),
-        ),
-        (
-            WhoamiProbe(cfg.dns.whoami_name, cfg.dns.whoami_resolver),
-            Target(host=target_host, port=53, service="DNS-Whoami"),
-        ),
-        (
-            NxdomainProbe(cfg.dns.nxdomain_count, cfg.dns.nxdomain_resolver),
-            Target(host=target_host, port=53, service="DNS-Nxdomain"),
-        ),
-        (
-            DohCrossCheckProbe(
-                cfg.dns.doh_crosscheck_domains,
-                cfg.dns.doh_crosscheck_resolver,
-                cfg.dns.doh_crosscheck_url,
+        if not cfg.general.quiet and not cfg.general.json_output:
+            _render_config_table("dns", cfg, active_ports, console)
+
+        ctx = Context(
+            mode=cfg.ports.mode,
+            timeout=cfg.dns.timeout,
+            retries=cfg.dns.retries,
+            runs=cfg.ports.runs,
+            control_target=Target(
+                host=cfg.general.control_target,
+                port=53,
+                service="Control-DNS",
             ),
-            Target(host=target_host, port=53, service="DNS-DoH"),
-        ),
-        (
-            SourceMismatchProbe(cfg.dns.source_mismatch_resolvers),
-            Target(host=target_host, port=53, service="DNS-SourceMismatch"),
-        ),
-    ]
+        )
 
-    _execute_audit_flow(
-        command_name="dns",
-        jobs=jobs,
-        ctx=ctx,
-        cfg=cfg,
-        console=console,
-    )
+        target_host = cfg.general.target or "auto"
+        jobs: list[tuple[Probe, Target]] = [
+            (
+                BlackholeProbe(cfg.dns.blackhole_servers),
+                Target(host=target_host, port=53, service="DNS-Blackhole"),
+            ),
+            (
+                WhoamiProbe(cfg.dns.whoami_name, cfg.dns.whoami_resolver),
+                Target(host=target_host, port=53, service="DNS-Whoami"),
+            ),
+            (
+                NxdomainProbe(cfg.dns.nxdomain_count, cfg.dns.nxdomain_resolver),
+                Target(host=target_host, port=53, service="DNS-Nxdomain"),
+            ),
+            (
+                DohCrossCheckProbe(
+                    cfg.dns.doh_crosscheck_domains,
+                    cfg.dns.doh_crosscheck_resolver,
+                    cfg.dns.doh_crosscheck_url,
+                ),
+                Target(host=target_host, port=53, service="DNS-DoH"),
+            ),
+            (
+                SourceMismatchProbe(cfg.dns.source_mismatch_resolvers),
+                Target(host=target_host, port=53, service="DNS-SourceMismatch"),
+            ),
+        ]
+
+        _execute_audit_flow(
+            command_name="dns",
+            jobs=jobs,
+            ctx=ctx,
+            cfg=cfg,
+            console=console,
+        )
 
 
 @app.command("http")
@@ -957,6 +1057,9 @@ def http(
     ),
     demo: bool = typer.Option(False, "--demo", help="Run with mock data."),
     config: Path | None = typer.Option(None, "--config", "-c", help="Path to YAML config."),
+    no_banner: bool = typer.Option(
+        False, "--no-banner", help="Disable gradient header and footer."
+    ),
 ) -> None:
     """Audit HTTP tampering, header injection, and captive portal interception."""
     cfg, active_ports, console = _prepare_config(
@@ -977,52 +1080,60 @@ def http(
         config=config,
         require_target=True,
     )
-    if demo:
-        report = build_demo_report()
-        report.metadata.mode = cfg.ports.mode
-        report.metadata.runs_per_check = cfg.ports.runs
-        report.metadata.include_identifiers = cfg.general.include_identifiers
-        if cfg.general.target:
-            report.metadata.target = cfg.general.target
-        handle_report_completion(report, cfg, "http", console)
-
-    if not cfg.general.quiet and not cfg.general.json_output:
-        _render_config_table("http", cfg, active_ports, console)
-
-    target_host = cfg.general.target or ""
-    http_ports = [p.port for p in active_ports] if ports is not None else cfg.http.ports
-
-    ctx = Context(
+    with ui_session(
+        command="http",
+        target=cfg.general.target,
         mode=cfg.ports.mode,
-        timeout=cfg.http.timeout,
-        retries=cfg.http.retries,
-        runs=cfg.ports.runs,
-        control_target=Target(
-            host=target_host,
-            port=cfg.ports.control_port,
-            service="Control",
-            expect_open=True,
-        ),
-    )
+        json_flag=json_output,
+        quiet_flag=quiet,
+        no_banner=no_banner,
+    ):
+        if demo:
+            report = build_demo_report()
+            report.metadata.mode = cfg.ports.mode
+            report.metadata.runs_per_check = cfg.ports.runs
+            report.metadata.include_identifiers = cfg.general.include_identifiers
+            if cfg.general.target:
+                report.metadata.target = cfg.general.target
+            handle_report_completion(report, cfg, "http", console)
 
-    probe = HttpCanaryProbe(
-        http_port=80,
-        https_port=443,
-        user_agent=cfg.http.user_agent,
-    )
+        if not cfg.general.quiet and not cfg.general.json_output:
+            _render_config_table("http", cfg, active_ports, console)
 
-    jobs: list[tuple[Probe, Target]] = []
-    for p in http_ports:
-        service_name = "HTTP" if p == 80 else ("HTTPS" if p == 443 else f"HTTP-{p}")
-        jobs.append((probe, Target(host=target_host, port=p, service=service_name)))
+        target_host = cfg.general.target or ""
+        http_ports = [p.port for p in active_ports] if ports is not None else cfg.http.ports
 
-    _execute_audit_flow(
-        command_name="http",
-        jobs=jobs,
-        ctx=ctx,
-        cfg=cfg,
-        console=console,
-    )
+        ctx = Context(
+            mode=cfg.ports.mode,
+            timeout=cfg.http.timeout,
+            retries=cfg.http.retries,
+            runs=cfg.ports.runs,
+            control_target=Target(
+                host=target_host,
+                port=cfg.ports.control_port,
+                service="Control",
+                expect_open=True,
+            ),
+        )
+
+        probe = HttpCanaryProbe(
+            http_port=80,
+            https_port=443,
+            user_agent=cfg.http.user_agent,
+        )
+
+        jobs: list[tuple[Probe, Target]] = []
+        for p in http_ports:
+            service_name = "HTTP" if p == 80 else ("HTTPS" if p == 443 else f"HTTP-{p}")
+            jobs.append((probe, Target(host=target_host, port=p, service=service_name)))
+
+        _execute_audit_flow(
+            command_name="http",
+            jobs=jobs,
+            ctx=ctx,
+            cfg=cfg,
+            console=console,
+        )
 
 
 def _print_invalid_report_help(
@@ -1129,28 +1240,40 @@ def compare(
     ),
     no_color: bool = typer.Option(False, "--no-color", help="Disable color formatting."),
     json_output: bool = typer.Option(False, "--json", help="Format output as JSON."),
+    no_banner: bool = typer.Option(
+        False, "--no-banner", help="Disable gradient header and footer."
+    ),
 ) -> None:
     """Compare two audit reports (.json or .jsonl) to highlight differences in network policies."""
-    console = Console(no_color=no_color)
-    a = _load_or_reclassify_report(report_a, console)
-    b = _load_or_reclassify_report(report_b, console)
+    with ui_session(
+        command="compare",
+        target=f"{report_a.name} vs {report_b.name}",
+        mode="diff",
+        json_flag=json_output,
+        quiet_flag=False,
+        no_banner=no_banner,
+    ):
+        console = Console(no_color=no_color)
+        a = _load_or_reclassify_report(report_a, console)
+        b = _load_or_reclassify_report(report_b, console)
 
-    diffs, table = compare_reports(a, b)
-    if diffs:
+        diffs, table = compare_reports(a, b)
+        if diffs:
+            if json_output:
+                diff_dicts = [d.to_dict() for d in diffs]
+                print(json.dumps({"changed": True, "diffs": diff_dicts}, indent=2))
+            else:
+                console.print(table)
+            raise typer.Exit(code=1)
+
         if json_output:
-            print(json.dumps({"changed": True, "diffs": [d.to_dict() for d in diffs]}, indent=2))
+            print(json.dumps({"changed": False, "diffs": []}, indent=2))
         else:
-            console.print(table)
-        raise typer.Exit(code=1)
-
-    if json_output:
-        print(json.dumps({"changed": False, "diffs": []}, indent=2))
-    else:
-        console.print(
-            "[bold green]✓ No policy changes detected. "
-            "Both audit reports are identical.[/bold green]"
-        )
-    raise typer.Exit(code=0)
+            console.print(
+                "[bold green]✓ No policy changes detected. "
+                "Both audit reports are identical.[/bold green]"
+            )
+        raise typer.Exit(code=0)
 
 
 @app.command("lab")
@@ -1175,78 +1298,151 @@ def reclassify(
         False, "--include-identifiers", help="Include SSID/MAC/IP in output."
     ),
     config: Path | None = typer.Option(None, "--config", "-c", help="Path to YAML config."),
+    no_banner: bool = typer.Option(
+        False, "--no-banner", help="Disable gradient header and footer."
+    ),
 ) -> None:
     """Reclassify raw observations from a saved .jsonl file through updated classifier rules."""
-    console = Console(no_color=no_color)
-    cfg, _, _ = _prepare_config(
+    with ui_session(
         command="reclassify",
-        target=None,
-        ports=None,
-        runs=1,
-        timeout=3.0,
-        retries=2,
-        mode=ProbeMode.AUTO,
-        json_output=json_output,
-        quiet=quiet,
-        verbose=verbose,
-        no_color=no_color,
-        output=output,
-        include_identifiers=include_identifiers,
-        demo=False,
-        config=config,
-        require_target=False,
-    )
+        target=Path(run_id).name,
+        mode="offline",
+        json_flag=json_output,
+        quiet_flag=quiet,
+        no_banner=no_banner,
+    ):
+        console = Console(no_color=no_color)
+        cfg, _, _ = _prepare_config(
+            command="reclassify",
+            target=None,
+            ports=None,
+            runs=1,
+            timeout=3.0,
+            retries=2,
+            mode=ProbeMode.AUTO,
+            json_output=json_output,
+            quiet=quiet,
+            verbose=verbose,
+            no_color=no_color,
+            output=output,
+            include_identifiers=include_identifiers,
+            demo=False,
+            config=config,
+            require_target=False,
+        )
 
-    # Locate the .jsonl file
-    target_path = Path(run_id)
-    candidates = [
-        target_path,
-        Path("reports") / run_id,
-        Path("reports") / f"{run_id}.jsonl",
-        Path("reports") / f"{target_path.stem}.jsonl",
-    ]
-    resolved_path: Path | None = None
-    for cand in candidates:
-        if cand.is_file():
-            resolved_path = cand
-            break
+        # Locate the .jsonl file
+        target_path = Path(run_id)
+        candidates = [
+            target_path,
+            Path("reports") / run_id,
+            Path("reports") / f"{run_id}.jsonl",
+            Path("reports") / f"{target_path.stem}.jsonl",
+        ]
+        resolved_path: Path | None = None
+        for cand in candidates:
+            if cand.is_file():
+                resolved_path = cand
+                break
 
-    if resolved_path is None:
+        if resolved_path is None:
+            console.print(
+                f"[bold red]Error:[/bold red] Could not find audit run file '{run_id}'. "
+                "Searched in current working directory and ./reports/."
+            )
+            raise typer.Exit(code=2)
+
+        try:
+            observations = read_run(resolved_path)
+        except Exception as exc:
+            console.print(f"[bold red]Error reading run file:[/bold red] {exc}")
+            raise typer.Exit(code=2) from exc
+
+        if not observations:
+            console.print(
+                f"[bold red]Error:[/bold red] No valid observations found in '{resolved_path}'."
+            )
+            raise typer.Exit(code=2)
+
+        meta = ReportMetadata(
+            tool_version=__version__,
+            network_label="Reclassified-Run",
+            network_fingerprint=Context.compute_network_fingerprint(),
+            client_address="127.0.0.1",
+            mode="auto",
+            runs_per_check=1,
+            include_identifiers=include_identifiers,
+        )
+
+        report = build_audit_report(
+            observations=observations,
+            control_healthy=True,
+            metadata=meta,
+        )
+
+        handle_report_completion(report, cfg, "audit", console)
+
+
+@app.command(
+    "wizard",
+    help="Interactive guided wizard to configure and run network policy audits.",
+)
+def wizard(
+    graph: str | None = typer.Option(
+        None,
+        "--graph",
+        help="Export finite-state machine graph and exit (mermaid | dot).",
+    ),
+    transcript: Path | None = typer.Option(
+        None,
+        "--transcript",
+        help="Custom file path to save the session JSON transcript.",
+    ),
+    replay: Path | None = typer.Option(
+        None,
+        "--replay",
+        hidden=True,
+        help="Replay a previously saved session transcript file.",
+    ),
+) -> None:
+    """Run the interactive guided wizard or inspect its state machine."""
+    from netpolicy.wizard.fsm import to_dot, to_mermaid
+
+    if graph:
+        fmt = graph.lower().strip()
+        if fmt == "mermaid":
+            sys.stdout.write(to_mermaid() + "\n")
+            raise typer.Exit(code=0)
+        elif fmt == "dot":
+            sys.stdout.write(to_dot() + "\n")
+            raise typer.Exit(code=0)
+        else:
+            console = Console(stderr=True)
+            console.print(
+                f"[bold red]Error:[/bold red] Unknown graph format '{graph}'. "
+                "Supported formats: mermaid, dot."
+            )
+            raise typer.Exit(code=2)
+
+    if replay:
+        from netpolicy.wizard.ui import run_replay
+
+        code = run_replay(replay)
+        raise typer.Exit(code=code)
+
+    is_interactive = sys.stdin.isatty() and sys.stderr.isatty()
+    if not is_interactive:
+        console = Console(stderr=True)
         console.print(
-            f"[bold red]Error:[/bold red] Could not find audit run file '{run_id}'. "
-            "Searched in current working directory and ./reports/."
+            "[bold red]Error:[/bold red] 'netpolicy wizard' requires an interactive terminal. "
+            "Use --help for subcommands."
         )
         raise typer.Exit(code=2)
 
-    try:
-        observations = read_run(resolved_path)
-    except Exception as exc:
-        console.print(f"[bold red]Error reading run file:[/bold red] {exc}")
-        raise typer.Exit(code=2) from exc
+    from netpolicy.wizard.ui import run_wizard
 
-    if not observations:
-        console.print(
-            f"[bold red]Error:[/bold red] No valid observations found in '{resolved_path}'."
-        )
-        raise typer.Exit(code=2)
-
-    meta = ReportMetadata(
-        tool_version=__version__,
-        network_label="Reclassified-Run",
-        network_fingerprint=Context.compute_network_fingerprint(),
-        client_address="127.0.0.1",
-        mode="auto",
-        runs_per_check=1,
-        include_identifiers=include_identifiers,
-    )
-
-    report = build_audit_report(
-        observations=observations,
-        control_healthy=True,
-        metadata=meta,
-    )
-
-    handle_report_completion(report, cfg, "audit", console)
+    code, _ = run_wizard(transcript_path=transcript)
+    raise typer.Exit(code=code)
 
 
 if __name__ == "__main__":
